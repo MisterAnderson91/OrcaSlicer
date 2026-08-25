@@ -1,31 +1,18 @@
 #include <catch2/catch_all.hpp>
 
 #include <boost/filesystem.hpp>
+#include <fstream>
 
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/AppConfig.hpp"
+
+#include "test_utils.hpp"
 
 using namespace Slic3r;
 
 namespace {
 
 namespace fs = boost::filesystem;
-
-struct TempPresetDir {
-    fs::path path;
-
-    TempPresetDir()
-    {
-        path = fs::temp_directory_path() / fs::unique_path("orcaslicer-preset-%%%%-%%%%-%%%%");
-        fs::create_directories(path);
-    }
-
-    ~TempPresetDir()
-    {
-        boost::system::error_code ec;
-        fs::remove_all(path, ec);
-    }
-};
 
 void write_print_preset(const DynamicPrintConfig &default_config, const fs::path &file, const std::string &name, const std::string &inherits = {})
 {
@@ -82,17 +69,17 @@ struct RenameTestCollection : public PresetCollection
 
 TEST_CASE("Preset identity is canonicalized from load path", "[Preset][Identity]")
 {
-    TempPresetDir              temp_dir;
+    ScopedTemporaryDir         temp_dir;
     PresetBundle               bundle;
     PresetsConfigSubstitutions substitutions;
 
-    write_print_preset(bundle.prints.default_preset().config, temp_dir.path / PRESET_PRINT_NAME / "User.json", "User");
-    write_print_preset(bundle.prints.default_preset().config, temp_dir.path / PRESET_LOCAL_DIR / "bundle-1" / PRESET_PRINT_NAME / "LocalBundle.json", "LocalBundle");
-    write_print_preset(bundle.prints.default_preset().config, temp_dir.path / PRESET_SUBSCRIBED_DIR / "remote-1" / PRESET_PRINT_NAME / "Subscribed.json", "Subscribed");
+    write_print_preset(bundle.prints.default_preset().config, temp_dir.path() / PRESET_PRINT_NAME / "User.json", "User");
+    write_print_preset(bundle.prints.default_preset().config, temp_dir.path() / PRESET_LOCAL_DIR / "bundle-1" / PRESET_PRINT_NAME / "LocalBundle.json", "LocalBundle");
+    write_print_preset(bundle.prints.default_preset().config, temp_dir.path() / PRESET_SUBSCRIBED_DIR / "remote-1" / PRESET_PRINT_NAME / "Subscribed.json", "Subscribed");
 
-    bundle.prints.load_presets(temp_dir.path.string(), PRESET_PRINT_NAME, substitutions, ForwardCompatibilitySubstitutionRule::Disable);
-    bundle.prints.load_presets((temp_dir.path / PRESET_LOCAL_DIR / "bundle-1").string(), PRESET_PRINT_NAME, substitutions, ForwardCompatibilitySubstitutionRule::Disable);
-    bundle.prints.load_presets((temp_dir.path / PRESET_SUBSCRIBED_DIR / "remote-1").string(), PRESET_PRINT_NAME, substitutions, ForwardCompatibilitySubstitutionRule::Disable);
+    bundle.prints.load_presets(temp_dir.path().string(), PRESET_PRINT_NAME, substitutions, ForwardCompatibilitySubstitutionRule::Disable);
+    bundle.prints.load_presets((temp_dir.path() / PRESET_LOCAL_DIR / "bundle-1").string(), PRESET_PRINT_NAME, substitutions, ForwardCompatibilitySubstitutionRule::Disable);
+    bundle.prints.load_presets((temp_dir.path() / PRESET_SUBSCRIBED_DIR / "remote-1").string(), PRESET_PRINT_NAME, substitutions, ForwardCompatibilitySubstitutionRule::Disable);
 
     const Preset *root_user = bundle.prints.find_preset("User");
     REQUIRE(root_user != nullptr);
@@ -112,14 +99,14 @@ TEST_CASE("Preset identity is canonicalized from load path", "[Preset][Identity]
 
 TEST_CASE("Legacy bundle import without bundle metadata stays in the user preset directory", "[Preset][Identity]")
 {
-    TempPresetDir temp_dir;
+    ScopedTemporaryDir temp_dir;
     PresetBundle  bundle;
 
     PresetsConfigSubstitutions substitutions;
     std::vector<std::string>   result;
     int                        overwrite = 0;
-    std::string                file      = (temp_dir.path / "legacy-bundle" / "Imported.json").string();
-    const fs::path             user_root = temp_dir.path / "user";
+    std::string                file      = (temp_dir.path() / "legacy-bundle" / "Imported.json").string();
+    const fs::path             user_root = temp_dir.path() / "user";
 
     write_print_preset(bundle.prints.default_preset().config, file, "Imported");
     fs::create_directories(user_root);
@@ -146,7 +133,7 @@ TEST_CASE("Current vendor type tolerates missing printer model", "[Preset][Bundl
 {
     PresetBundle bundle;
 
-    VendorProfile orca_vendor("ORCA");
+    VendorProfile orca_vendor; orca_vendor.id = "ORCA";
     VendorProfile::PrinterModel model;
     model.name = "Orca Test";
     orca_vendor.models.emplace_back(model);
@@ -155,6 +142,31 @@ TEST_CASE("Current vendor type tolerates missing printer model", "[Preset][Bundl
     bundle.printers.get_edited_preset().config.erase("printer_model");
 
     CHECK(bundle.get_current_vendor_type() == VendorType::Unknown);
+}
+
+TEST_CASE("A malformed entry in a vendor's preset list is counted, not thrown", "[Preset][Bundle]")
+{
+    ScopedTemporaryDir dir;
+
+    // A bare number where the list wants an object. An array element has no key,
+    // so reporting one as if it did throws nlohmann's invalid_iterator - which is
+    // not a parse_error, and escapes the catch around the vendor profile parse.
+    std::ofstream((dir.path() / "Acme.json").string())
+        << R"({"version":"1.0.0","name":"Acme","process_list":[123,)"
+        << R"({"name":"0.20mm Standard @Acme","sub_path":"process/standard.json"}]})";
+    fs::create_directories(dir.path() / "Acme" / "process");
+    std::ofstream((dir.path() / "Acme" / "process" / "standard.json").string())
+        << R"({"type":"process","name":"0.20mm Standard @Acme","from":"system",)"
+        << R"("instantiation":"true","layer_height":"0.2"})";
+
+    PresetBundle bundle;
+    size_t       loaded = 0;
+    REQUIRE_NOTHROW(loaded = bundle.load_vendor_configs_from_json(
+                        dir.path().string(), "Acme", PresetBundle::LoadSystem,
+                        ForwardCompatibilitySubstitutionRule::EnableSilent).second);
+
+    CHECK(bundle.error_count() > 0);   // the malformed element was counted
+    CHECK(loaded == 1);                // the well-formed one beside it still loaded
 }
 
 TEST_CASE("Printer extruder count tolerates missing nozzle diameter", "[Preset][Bundle]")
@@ -252,7 +264,7 @@ TEST_CASE("find_preset2 auto-matches removed Generic vendor profiles to the libr
 
 TEST_CASE("Renamed parent is normalized into a loaded preset's inherits", "[Preset][Rename]")
 {
-    TempPresetDir        temp_dir;
+    ScopedTemporaryDir   temp_dir;
     RenameTestCollection coll;
 
     // Current parent, renamed from "Old Process".
@@ -262,10 +274,10 @@ TEST_CASE("Renamed parent is normalized into a loaded preset's inherits", "[Pres
 
     // A user preset on disk that still inherits the OLD name.
     write_preset_with_inherits(coll.default_preset().config,
-                               temp_dir.path / PRESET_PRINT_NAME / "Child.json", "Child", "Old Process");
+                               temp_dir.path() / PRESET_PRINT_NAME / "Child.json", "Child", "Old Process");
 
     PresetsConfigSubstitutions substitutions;
-    coll.load_presets(temp_dir.path.string(), PRESET_PRINT_NAME, substitutions,
+    coll.load_presets(temp_dir.path().string(), PRESET_PRINT_NAME, substitutions,
                       ForwardCompatibilitySubstitutionRule::Disable);
 
     const Preset *child = coll.find_preset("Child");
@@ -279,17 +291,17 @@ TEST_CASE("Renamed parent is normalized into a loaded preset's inherits", "[Pres
 
 TEST_CASE("Removed Generic parent is normalized into a loaded filament's inherits", "[Preset][Rename]")
 {
-    TempPresetDir temp_dir;
+    ScopedTemporaryDir temp_dir;
     PresetBundle  bundle;
 
     add_inmemory_preset(bundle.filaments, "Generic PLA @System");
 
     // A user filament that still inherits a removed "<vendor> Generic PLA" profile.
     write_preset_with_inherits(bundle.filaments.default_preset().config,
-                               temp_dir.path / PRESET_FILAMENT_NAME / "MyPLA.json", "MyPLA", "Voron Generic PLA");
+                               temp_dir.path() / PRESET_FILAMENT_NAME / "MyPLA.json", "MyPLA", "Voron Generic PLA");
 
     PresetsConfigSubstitutions substitutions;
-    bundle.filaments.load_presets(temp_dir.path.string(), PRESET_FILAMENT_NAME, substitutions,
+    bundle.filaments.load_presets(temp_dir.path().string(), PRESET_FILAMENT_NAME, substitutions,
                                   ForwardCompatibilitySubstitutionRule::Disable);
 
     const Preset *child = bundle.filaments.find_preset("MyPLA");
